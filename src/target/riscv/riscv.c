@@ -623,12 +623,12 @@ static int find_first_trigger_by_id(struct target *target, int unique_id)
 
 static unsigned int count_trailing_ones(riscv_reg_t reg)
 {
-	assert(sizeof(riscv_reg_t) * 8 == 64);
-	for (unsigned int i = 0; i < 64; i++) {
+	const unsigned int riscv_reg_bits = sizeof(riscv_reg_t) * CHAR_BIT;
+	for (unsigned int i = 0; i < riscv_reg_bits; i++) {
 		if ((1 & (reg >> i)) == 0)
 			return i;
 	}
-	return 64;
+	return riscv_reg_bits;
 }
 
 static int set_trigger(struct target *target, unsigned int idx, riscv_reg_t tdata1, riscv_reg_t tdata2)
@@ -1576,6 +1576,7 @@ static int riscv_trigger_detect_hit_bits(struct target *target, int64_t *unique_
 
 	// FIXME: Add hit bits support detection and caching
 	RISCV_INFO(r);
+	r->need_single_step = false;
 
 	riscv_reg_t tselect;
 	if (riscv_reg_get(target, &tselect, GDB_REGNO_TSELECT) != ERROR_OK)
@@ -1589,21 +1590,100 @@ static int riscv_trigger_detect_hit_bits(struct target *target, int64_t *unique_
 		if (riscv_reg_set(target, GDB_REGNO_TSELECT, i) != ERROR_OK)
 			return ERROR_FAIL;
 
-		uint64_t tdata1;
+		uint64_t tdata1, tdata1_test_rb;
 		if (riscv_reg_get(target, &tdata1, GDB_REGNO_TDATA1) != ERROR_OK)
 			return ERROR_FAIL;
 		int type = get_field(tdata1, CSR_TDATA1_TYPE(riscv_xlen(target)));
 
 		uint64_t hit_mask = 0;
+		bool mcontrol_hit_not_supported = false;
+		bool mcontrol6_hit_not_supported = false;
 		switch (type) {
 			case CSR_TDATA1_TYPE_LEGACY:
 				/* Doesn't support hit bit. */
 				break;
 			case CSR_TDATA1_TYPE_MCONTROL:
 				hit_mask = CSR_MCONTROL_HIT;
+				/* Check if mcontrol.hit is implemented */
+				if ((tdata1 & hit_mask) == 0) {
+					uint64_t tdata1_test =
+					set_field(tdata1, CSR_MCONTROL_HIT, 1);
+					if (riscv_reg_set(target,
+					GDB_REGNO_TDATA1, tdata1_test) != ERROR_OK)
+						return ERROR_FAIL;
+					if (riscv_reg_get(target,
+					&tdata1_test_rb, GDB_REGNO_TDATA1) != ERROR_OK)
+						return ERROR_FAIL;
+					int tdata1_test_hit =
+					get_field(tdata1_test, CSR_MCONTROL_HIT);
+					int tdata1_test_rb_hit =
+					get_field(tdata1_test_rb, CSR_MCONTROL_HIT);
+					if (tdata1_test_hit != tdata1_test_rb_hit)
+						mcontrol_hit_not_supported = true;
+					if (riscv_reg_set(target, GDB_REGNO_TDATA1,
+						tdata1_test & ~hit_mask) != ERROR_OK)
+						return ERROR_FAIL;
+				}
+
+				if (get_field(tdata1, CSR_MCONTROL_TIMING)
+				== CSR_MCONTROL_TIMING_BEFORE
+				    && (mcontrol_hit_not_supported || (tdata1 & hit_mask)))
+					r->need_single_step = true;
 				break;
 			case CSR_TDATA1_TYPE_MCONTROL6:
 				hit_mask = CSR_MCONTROL6_HIT0 | CSR_MCONTROL6_HIT1;
+				int hit0 = get_field(tdata1, CSR_MCONTROL6_HIT0);
+				int hit1 = get_field(tdata1, CSR_MCONTROL6_HIT1);
+				int trigger_retired_info = (hit1 << 1) | hit0;
+				/* Check if mcontrol6.hit0[1] is not implemented. */
+				if (trigger_retired_info == 0) {
+					for (unsigned int j = 0; j < 2; j++) {
+						uint64_t tdata1_test =
+							set_field(tdata1, CSR_MCONTROL6_HIT0, j);
+						for (unsigned int k = 0; k < 2; k++) {
+							tdata1_test =
+							set_field(tdata1_test, CSR_MCONTROL6_HIT1, k);
+							if (riscv_reg_set(target,
+								GDB_REGNO_TDATA1, tdata1_test) != ERROR_OK)
+								return ERROR_FAIL;
+							if (riscv_reg_get(target,
+								&tdata1_test_rb, GDB_REGNO_TDATA1) != ERROR_OK)
+								return ERROR_FAIL;
+							int tdata1_test_hit0 =
+								get_field(tdata1_test, CSR_MCONTROL6_HIT0);
+							int tdata1_test_rb_hit0 =
+								get_field(tdata1_test_rb, CSR_MCONTROL6_HIT0);
+							int tdata1_test_hit1 =
+								get_field(tdata1_test, CSR_MCONTROL6_HIT1);
+							int tdata1_test_rb_hit1 =
+								get_field(tdata1_test_rb, CSR_MCONTROL6_HIT1);
+							int trigger_retired_test_info =
+								(tdata1_test_hit1 << 1) | tdata1_test_hit0;
+							int trigger_retired_test_rb_info =
+								(tdata1_test_rb_hit1 << 1) | tdata1_test_rb_hit0;
+							if (trigger_retired_test_info == 0)
+								continue;
+
+							if (trigger_retired_test_info
+								!= trigger_retired_test_rb_info) {
+								mcontrol6_hit_not_supported = true;
+							} else {
+								mcontrol6_hit_not_supported = false;
+								if (riscv_reg_set(target, GDB_REGNO_TDATA1,
+									tdata1_test & ~hit_mask) != ERROR_OK)
+									return ERROR_FAIL;
+								goto done;
+							}
+						}
+						if (riscv_reg_set(target, GDB_REGNO_TDATA1,
+							tdata1_test & ~hit_mask) != ERROR_OK)
+							return ERROR_FAIL;
+					}
+				}
+done:
+				if (mcontrol6_hit_not_supported
+				    || trigger_retired_info == CSR_MCONTROL6_HIT0_BEFORE)
+					r->need_single_step = true;
 				break;
 			case CSR_TDATA1_TYPE_ICOUNT:
 				hit_mask = CSR_ICOUNT_HIT;
@@ -2553,10 +2633,19 @@ static int resume_prep(struct target *target, int current,
 	if (handle_breakpoints) {
 		/* To be able to run off a trigger, we perform a step operation and then
 		 * resume. If handle_breakpoints is true then step temporarily disables
-		 * pending breakpoints so we can safely perform the step. */
-		if (old_or_new_riscv_step_impl(target, current, address, handle_breakpoints,
-				false /* callbacks are not called */) != ERROR_OK)
-			return ERROR_FAIL;
+		 * pending breakpoints so we can safely perform the step.
+		 *
+		 * Two cases where single step is needed before resuming:
+		 * 1. ebreak used in software breakpoint;
+		 * 2. a trigger that is taken just before the instruction that triggered it is retired.
+		 */
+		if (target->debug_reason == DBG_REASON_BREAKPOINT
+		    || (target->debug_reason == DBG_REASON_WATCHPOINT
+			&& r->need_single_step)) {
+			if (old_or_new_riscv_step_impl(target, current, address, handle_breakpoints,
+					false /* callbacks are not called */) != ERROR_OK)
+				return ERROR_FAIL;
+		}
 	}
 
 	if (r->get_hart_state) {
