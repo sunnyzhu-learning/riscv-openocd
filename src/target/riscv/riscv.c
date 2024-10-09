@@ -623,12 +623,12 @@ static int find_first_trigger_by_id(struct target *target, int unique_id)
 
 static unsigned int count_trailing_ones(riscv_reg_t reg)
 {
-	assert(sizeof(riscv_reg_t) * 8 == 64);
-	for (unsigned int i = 0; i < 64; i++) {
+	const unsigned int riscv_reg_bits = sizeof(riscv_reg_t) * CHAR_BIT;
+	for (unsigned int i = 0; i < riscv_reg_bits; i++) {
 		if ((1 & (reg >> i)) == 0)
 			return i;
 	}
-	return 64;
+	return riscv_reg_bits;
 }
 
 static int set_trigger(struct target *target, unsigned int idx, riscv_reg_t tdata1, riscv_reg_t tdata2)
@@ -1576,6 +1576,7 @@ static int riscv_trigger_detect_hit_bits(struct target *target, int64_t *unique_
 
 	// FIXME: Add hit bits support detection and caching
 	RISCV_INFO(r);
+	r->need_single_step = false;
 
 	riscv_reg_t tselect;
 	if (riscv_reg_get(target, &tselect, GDB_REGNO_TSELECT) != ERROR_OK)
@@ -2278,6 +2279,67 @@ derive_debug_reason_without_hitbit(const struct target *target, riscv_reg_t dpc)
 	}
 	return DBG_REASON_WATCHPOINT;
 }
+
+static bool check_single_step_needed_in_hit_supported_case(struct target *target,
+			uint32_t unique_id)
+{
+	RISCV_INFO(r);
+	riscv_reg_t tselect;
+	if (riscv_reg_get(target, &tselect, GDB_REGNO_TSELECT) != ERROR_OK)
+		return ERROR_FAIL;
+	if (riscv_reg_set(target, GDB_REGNO_TSELECT, unique_id) != ERROR_OK)
+		return ERROR_FAIL;
+	riscv_reg_t tdata1;
+	if (riscv_reg_get(target, &tdata1, GDB_REGNO_TDATA1) != ERROR_OK)
+		return ERROR_FAIL;
+	int type = get_field(tdata1, CSR_TDATA1_TYPE(riscv_xlen(target)));
+	if (type == CSR_TDATA1_TYPE_MCONTROL) {
+		if (get_field(tdata1, CSR_MCONTROL_TIMING) == CSR_MCONTROL_TIMING_BEFORE)
+			r->need_single_step = true;
+	} else if (type == CSR_TDATA1_TYPE_MCONTROL6) {
+		int hit0 = get_field(tdata1, CSR_MCONTROL6_HIT0);
+		int hit1 = get_field(tdata1, CSR_MCONTROL6_HIT1);
+		int trigger_retired_info = (hit1 << 1) | hit0;
+		if (trigger_retired_info == CSR_MCONTROL6_HIT0_BEFORE)
+			r->need_single_step = true;
+	} else {
+		r->need_single_step = false;
+	}
+	if (riscv_reg_set(target, GDB_REGNO_TSELECT, tselect) != ERROR_OK)
+		return ERROR_FAIL;
+	return r->need_single_step;
+}
+
+static bool check_single_step_needed_in_hit_unsupported_case(struct target *target)
+{
+	RISCV_INFO(r);
+	r->need_single_step = false;
+	riscv_reg_t tselect;
+	if (riscv_reg_get(target, &tselect, GDB_REGNO_TSELECT) != ERROR_OK)
+		return ERROR_FAIL;
+
+	for (unsigned int i = 0; i < r->trigger_count; i++) {
+		if (riscv_reg_set(target, GDB_REGNO_TSELECT, i) != ERROR_OK)
+			return ERROR_FAIL;
+
+		uint64_t tdata1;
+		if (riscv_reg_get(target, &tdata1, GDB_REGNO_TDATA1) != ERROR_OK)
+			return ERROR_FAIL;
+		int type = get_field(tdata1, CSR_TDATA1_TYPE(riscv_xlen(target)));
+		if (type == CSR_TDATA1_TYPE_MCONTROL) {
+			if (get_field(tdata1, CSR_MCONTROL_TIMING) == CSR_MCONTROL_TIMING_BEFORE)
+				r->need_single_step = true;
+		} else if (type == CSR_TDATA1_TYPE_MCONTROL6) {
+			r->need_single_step = true;
+		}
+	}
+	if (riscv_reg_set(target, GDB_REGNO_TSELECT, tselect) != ERROR_OK)
+		return ERROR_FAIL;
+
+	return r->need_single_step;
+}
+
+
 /**
  * Set OpenOCD's generic debug reason from the RISC-V halt reason.
  */
@@ -2319,6 +2381,7 @@ static int set_debug_reason(struct target *target, enum riscv_halt_reason halt_r
 							LOG_TARGET_DEBUG(target,
 								"Watchpoint with unique_id = %" PRIu32 " owns the trigger.",
 								wp->unique_id);
+							r->need_single_step = check_single_step_needed_in_hit_supported_case(target, wp->unique_id);
 						}
 					}
 				}
@@ -2336,6 +2399,7 @@ static int set_debug_reason(struct target *target, enum riscv_halt_reason halt_r
 				 * breakpoints and hope for the best)
 				 */
 				target->debug_reason = derive_debug_reason_without_hitbit(target, dpc);
+				r->need_single_step = check_single_step_needed_in_hit_unsupported_case(target);
 			}
 			break;
 		case RISCV_HALT_INTERRUPT:
@@ -2553,10 +2617,19 @@ static int resume_prep(struct target *target, int current,
 	if (handle_breakpoints) {
 		/* To be able to run off a trigger, we perform a step operation and then
 		 * resume. If handle_breakpoints is true then step temporarily disables
-		 * pending breakpoints so we can safely perform the step. */
-		if (old_or_new_riscv_step_impl(target, current, address, handle_breakpoints,
-				false /* callbacks are not called */) != ERROR_OK)
-			return ERROR_FAIL;
+		 * pending breakpoints so we can safely perform the step.
+		 *
+		 * Two cases where single step is needed before resuming:
+		 * 1. ebreak used in software breakpoint;
+		 * 2. a trigger that is taken just before the instruction that triggered it is retired.
+		 */
+		if (target->debug_reason == DBG_REASON_BREAKPOINT
+		    || (target->debug_reason == DBG_REASON_WATCHPOINT
+			&& r->need_single_step)) {
+			if (old_or_new_riscv_step_impl(target, current, address, handle_breakpoints,
+					false /* callbacks are not called */) != ERROR_OK)
+				return ERROR_FAIL;
+		}
 	}
 
 	if (r->get_hart_state) {
